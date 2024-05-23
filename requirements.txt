@@ -2,3 +2,7 @@ ultralytics
 numpy
 pandas
 matplotlib
+jupyter
+opencv-python
+Pillow
+tensorflow
