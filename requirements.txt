@@ -6,3 +6,4 @@ jupyter
 opencv-python
 Pillow
 tensorflow
+fastapi
