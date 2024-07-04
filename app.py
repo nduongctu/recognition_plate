@@ -1,126 +1,163 @@
-import os
 import torch
-from flask import Flask, request, render_template, Response
 import cv2
 import numpy as np
-from collections import defaultdict
+import uvicorn
+import asyncio
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
 from ultralytics import YOLO
 
-app = Flask(__name__)
-UPLOAD_FOLDER = os.path.join(os.getcwd(), 'uploads')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# thong tin xac thuc co ban
+USERNAME = "admin"
+PASSWORD = "123"
+
+# Khoi tao YOLO models
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(device)
+# Load models
+model_lp = YOLO("model/best_KBS_8n.pt")
+model_char = YOLO("model/best_char8n.pt")
 
-print("Loading YOLO models...")
-model_lp = YOLO('model/best_KBS_8n.pt', task='detect')
-model_char = YOLO("model/best_char_8n.pt", task='detect')
+# chuyen cac mo hinh sang cpu hoac cuda
+model_lp = model_lp.to(device)
+model_char = model_char.to(device)
 
-model_lp.to(device)
-model_char.to(device)
-print("YOLO models loaded successfully")
+model_lp.fuse()
+model_char.fuse()
 
-CHAR_THRES = 0.7
+# cac mo  hinh Pydantic cho các payload yeu cau & phan hoi
+class BoundingBox(BaseModel):
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+
+class DetectedObject(BaseModel):
+    label: str
+    bounding_box: BoundingBox
+    chars: List[str]
 
 def format_LP(chars, char_centers):
     if not chars:
         return []
 
-    x = [c[0] for c in char_centers]
-    y = [c[1] for c in char_centers]
-    y_mean = np.mean(y)
+    char_centers = np.array(char_centers)
+    y_mean = char_centers[:, 1].mean()
 
-    # Kiểm tra xem ký tự có trên cùng một dòng không
-    if max(y) - min(y) < 10:
-        return [i for _, i in sorted(zip(x, chars))]
+    sorted_indices = np.argsort(char_centers[:, 0])
+    sorted_chars = np.array(chars)[sorted_indices]
 
-    # Sắp xếp các ký tự theo tọa độ X
-    sorted_chars = [i for _, i in sorted(zip(x, chars))]
-    y = [i for _, i in sorted(zip(x, y))]
+    first_line = sorted_chars[char_centers[sorted_indices, 1] < y_mean]
+    second_line = sorted_chars[char_centers[sorted_indices, 1] >= y_mean]
 
-    # Phân chia ký tự thành hai dòng dựa trên tọa độ Y trung bình
-    first_line = [i for i in range(len(chars)) if y[i] < y_mean]
-    second_line = [i for i in range(len(chars)) if y[i] >= y_mean]
+    return list(first_line) + ['-'] + list(second_line) if len(second_line) > 0 else list(first_line)
 
-    # Ghép các ký tự đã sắp xếp theo thứ tự dòng và thêm dấu gạch ngang giữa hai dòng
-    return [sorted_chars[i] for i in first_line] + ['-'] + [sorted_chars[i] for i in second_line]
+def warm_up_model(model, size=(640, 640)):
+    dummy_input = torch.rand(1, 3, *size).to(device)
+    for _ in range(10):
+        with torch.no_grad():
+            _ = model(dummy_input)
 
-def detect_license_plate(video_path):
-    cap = cv2.VideoCapture(video_path)
-    track_history = defaultdict(list)
-    frame_count = 0
+# khoi dong truoc cac mo hinh truoc khi xu ly cac khung hinh thuc te
+print("Warming up LP model...")
+warm_up_model(model_lp)
+print("Warming up char model...")
+warm_up_model(model_char)
 
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            break
+# Route to serve index.html
+@app.get("/")
+async def read_index():
+    return FileResponse("templates/index_draw.html")
 
-        results = model_lp.track(frame, persist=True)
-        boxes = results[0].boxes.xywh.to(device)
-        track_ids = results[0].boxes.id.int().tolist()
+# ham process_frame
+def process_frame(frame_img):
+    results = model_lp(frame_img, conf=0.4, iou=0.2)
+    detected_objects = []
 
-        for box, track_id in zip(boxes, track_ids):
-            x, y, w, h = box
+    if len(results) > 0 and results[0].boxes is not None and len(results[0].boxes) > 0:
+        boxes = results[0].boxes.to(device)
 
-            x_min = int(max(x - w / 2, 0))
-            y_min = int(max(y - h / 2, 0))
-            x_max = int(min(x + w / 2, frame.shape[1]))
-            y_max = int(min(y + h / 2, frame.shape[0]))
-            roi = frame[y_min:y_max, x_min:x_max]
+        # Chuẩn bị batch của các biển số
+        plates = []
+        plate_info = []
 
-            annotated_frame = cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+        for box in boxes:
+            x, y, w, h = box.xywh[0].tolist()
+            cls = box.cls.item()
+            label = model_lp.names[int(cls)]
 
-            detected_texts = []
-            results_char = model_char(roi)
-            chars = []
-            char_centers = []
-            for result in results_char:
-                boxes = result.boxes.data.tolist()
-                for box in boxes:
-                    x_min_char, y_min_char, x_max_char, y_max_char, confidence, cls = box
-                    if confidence > CHAR_THRES:
-                        x_min_char, y_min_char, x_max_char, y_max_char = map(int, [x_min_char, y_min_char, x_max_char, y_max_char])
-                        cls = int(cls)
-                        chars.append(model_char.names[cls])
+            x1 = int(x - w / 2)
+            y1 = int(y - h / 2)
+            x2 = int(x + w / 2)
+            y2 = int(y + h / 2)
 
-                        center_x = (x_min_char + x_max_char) // 2
-                        center_y = (y_min_char + y_max_char) // 2
+            plate = frame_img[y1:y2, x1:x2]
+            plates.append(plate)
+            plate_info.append((label, BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2)))
+
+        # Xử lý các biển số
+        if plates:
+            # Chuẩn bị batch input
+            batch = torch.stack([torch.from_numpy(cv2.resize(p, (640, 640))).permute(2, 0, 1).float().div(255.0) for p in plates]).to(device)
+
+            # Sử dụng batch processing
+            results_plates = model_char(batch, conf=0.4, iou=0.2, agnostic_nms=True)
+
+            for idx, ((label, bounding_box), result_plate) in enumerate(zip(plate_info, results_plates)):
+                detected_chars = []
+                char_centers = []
+
+                if result_plate.boxes is not None and len(result_plate.boxes) > 0:
+                    boxes_char = result_plate.boxes.to(device)
+                    for box_char in boxes_char:
+                        x_char, y_char, w_char, h_char = box_char.xywh[0].tolist()
+                        cls_char = box_char.cls.item()
+                        label_char = model_char.names[int(cls_char)]
+                        detected_chars.append(label_char)
+
+                        center_x = int(x_char)
+                        center_y = int(y_char)
                         char_centers.append((center_x, center_y))
 
-            if chars:
-                detected_texts.append(''.join(format_LP(chars, char_centers)))
-                text = detected_texts[0]
-                cv2.putText(annotated_frame, text, (x_min, y_min - 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 255, 0), 4)
+                detected_texts = [''.join(format_LP(detected_chars, char_centers))] if detected_chars else []
 
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + cv2.imencode('.jpg', annotated_frame)[1].tobytes() + b'\r\n')
+                obj = DetectedObject(
+                    label=label,
+                    bounding_box=bounding_box,
+                    chars=detected_texts
+                )
+                detected_objects.append(obj)
 
-        frame_count += 1
+    return detected_objects
 
-    cap.release()
+# Route de xu ly khung hinh
+@app.post("/process_frame", response_model=List[DetectedObject])
+async def process_frame_api(frame: UploadFile = File(...), username: str = USERNAME, password: str = PASSWORD):
+    if username != USERNAME or password != PASSWORD:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+    frame_data = await frame.read()
+    frame_np = np.frombuffer(frame_data, np.uint8)
+    frame_img = cv2.imdecode(frame_np, cv2.IMREAD_COLOR)
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return "No file part", 400
+    loop = asyncio.get_event_loop()
+    detected_objects = await loop.run_in_executor(None, process_frame, frame_img)
 
-    file = request.files['file']
-    if file.filename == '':
-        return "No selected file", 400
+    return detected_objects
 
-    if file:
-        filename = 'test.mp4'
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-        return Response(detect_license_plate(filepath), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-    return "Upload failed", 500
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5505, debug=True)
+if __name__ == "__main__":
+    uvicorn.run(app, host="192.168.10.9", port=6066)
+    # uvicorn.run(app, host="192.168.10.8", port=6066, ssl_certfile="server.crt", ssl_keyfile="server.key")

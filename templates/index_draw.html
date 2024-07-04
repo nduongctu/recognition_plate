@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>License Plate Recognition</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        .video-container {
+            border: 2px solid;
+            position: relative;
+            width: 100%;
+            height: 300px;
+            overflow: hidden;
+        }
+        .video-container video, .video-container canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        #processButton {
+            width: 100%;
+        }
+        .drag-drop-area {
+            border: 2px solid;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        .drag-drop-area:hover {
+            background-color: #f0f0f0;
+        }
+        .drag-drop-area input[type="file"] {
+            display: none;
+        }
+        #fpsCounter {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.5);
+            color: white;
+            padding: 5px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container mt-4">
+        <div class="row">
+            <div class="col-md-6 mb-3">
+                <!--keo tha video hoac hon file -->
+                <div class="video-container drag-drop-area" id="dragDropArea">
+                    <input type="file" id="videoInput" accept="video/*">
+                    <p style="margin-top: 50px;">Drop Video Here <br> or <br> Click To Upload</p>
+                    <video id="inputVideo" controls muted playsinline style="display: none;">
+                        Trình duyệt của bạn không hỗ trợ thẻ video.
+                    </video>
+                </div>
+            </div>
+
+            <div class="col-md-6 mb-3">
+                <!--khu vuc hien thi ket qua-->
+                <div class="video-container">
+                    <p style="margin-top: 50px; text-align: center; padding: 20px;">Output</p>
+                    <canvas id="processedFrameCanvas" style="display: none;"></canvas>
+                    <div id="fpsCounter" class="alert alert-info" role="alert">FPS: 0.00</div>
+                </div>
+            </div>
+
+            <div class="col-md-12 mb-3">
+                <!--cac nut dieu khien-->
+                <button id="connectCam" type="button" class="btn btn-outline-primary">Connect Camera</button>
+                <button id="startProcessingButtonWebcam" type="button" class="btn btn-outline-success" style="display: none;">Start Processing Webcam</button>
+                <button id="startProcessingButtonVideo" type="button" class="btn btn-outline-success" style="display: none;">Start Processing Video</button>
+                <button id="stopProcessingButton" type="button" class="btn btn-outline-danger" style="display: none;">Stop Processing</button>
+                <select id="cameraSelection" class="form-select mb-3" style="display: none;">
+                    <option value="">Select Camera</option>
+                    <option value="user">Front Camera</option>
+                    <option value="environment">Rear Camera</option>
+                </select>
+            </div>
+        </div>
+    </div>
+    <script>
+        document.addEventListener("DOMContentLoaded", () => {
+            const apiUrl = "http://192.168.10.9:6066";
+            const apiToken = "Basic " + btoa("admin:123");
+
+            const videoInput = document.getElementById("videoInput");
+            const videoElement = document.getElementById("inputVideo");
+            const startProcessingButtonWebcam = document.getElementById("startProcessingButtonWebcam");
+            const startProcessingButtonVideo = document.getElementById("startProcessingButtonVideo");
+            const stopProcessingButton = document.getElementById("stopProcessingButton");
+            const processedFrameCanvas = document.getElementById("processedFrameCanvas");
+            const dragDropArea = document.getElementById("dragDropArea");
+            const connectCameraButton = document.getElementById("connectCam");
+            const cameraSelection = document.getElementById("cameraSelection");
+            const fpsCounter = document.getElementById("fpsCounter");
+
+            let file;
+            let processingInterval;
+            let isWebcamActive = false;
+            let currentStream;
+            let worker = new Worker(getWorkerBlobUrl());
+
+            let frameQueue = []; // khung hinh chua xu ly
+            let resultQueue = []; // khung hinh ket qua do server tra ve
+
+            let frameTimestamps = [];
+            const FPS_AVERAGE_WINDOW = 1000; // 1 secondf
+            let lastFpsUpdate = 0;
+            const FPS_UPDATE_INTERVAL = 500; // Update display every 500ms
+
+            worker.onmessage = function(event) {
+                const data = event.data;
+                if (data.imageData) { // du lieu tra ve tu server la hinh anh ( frame )
+                    resultQueue.push(data);
+                }
+            };
+            // su kien keo tha vao vung chua video
+            dragDropArea.addEventListener("click", () => videoInput.click());
+
+            dragDropArea.addEventListener("dragover", (event) => {
+                event.preventDefault();
+                dragDropArea.classList.add("drag-over");
+            });
+
+            dragDropArea.addEventListener("dragleave", () => {
+                dragDropArea.classList.remove("drag-over");
+            });
+
+            dragDropArea.addEventListener("drop", (event) => {
+                event.preventDefault();
+                dragDropArea.classList.remove("drag-over");
+                file = event.dataTransfer.files[0];
+                handleFile(file);
+                toggleButtonsForVideo();
+            });
+            // upload video
+            videoInput.addEventListener("change", (event) => {
+                file = event.target.files[0];
+                handleFile(file);
+                toggleButtonsForVideo();
+            });
+
+            // nut bta dau xu ly webcam
+            startProcessingButtonWebcam.addEventListener("click", () => {
+                if (!videoElement.srcObject) {
+                    alert("Vui lòng kết nối webcam trước khi bắt đầu xử lý.");
+                    return;
+                }
+                startProcessingButtonWebcam.style.display = 'none';
+                stopProcessingButton.style.display = 'inline-block';
+                startProcessing();
+            });
+            // nut bat dau xu ly video
+            startProcessingButtonVideo.addEventListener("click", () => {
+                if (!file) {
+                    alert("Vui lòng tải lên video trước khi bắt đầu xử lý.");
+                    return;
+                }
+                startProcessingButtonVideo.style.display = 'none';
+                stopProcessingButton.style.display = 'inline-block';
+                startProcessing();
+            });
+            //nut dung xu ly
+            stopProcessingButton.addEventListener("click", () => {
+                clearInterval(processingInterval);
+                startProcessingButtonWebcam.style.display = isWebcamActive ? 'inline-block' : 'none';
+                startProcessingButtonVideo.style.display = !isWebcamActive ? 'inline-block' : 'none';
+                stopProcessingButton.style.display = 'none';
+                if (!isWebcamActive && videoElement) {
+                    videoElement.pause();
+                }
+            });
+            // chon camera
+            cameraSelection.addEventListener("change", async () => {
+                startProcessingButtonWebcam.style.display = "none";
+                const selectedCamera = cameraSelection.value;
+
+                if (currentStream) {
+                    currentStream.getTracks().forEach(track => track.stop());
+                }
+
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('Trình duyệt không hỗ trợ truy cập vào thiết bị camera.');
+                }
+
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: selectedCamera } });
+                    videoElement.srcObject = stream;
+                    videoElement.style.display = "block";
+                    currentStream = stream;
+
+                    isWebcamActive = true;
+                    startProcessingButtonWebcam.style.display = 'inline-block';
+                } catch (error) {
+                    console.error('Lỗi khi kết nối với camera:', error);
+                    alert("Không thể kết nối với camera. Vui lòng chọn camera khác ! :> ");
+                }
+            });
+            //ket noi camera
+            connectCameraButton.addEventListener("click", () => {
+                cameraSelection.style.display = 'inline-block';
+                connectCameraButton.style.display = 'none';
+            });
+
+            function handleFile(file) {
+                if (file) {
+                    if (videoElement.srcObject) {
+                        const stream = videoElement.srcObject;
+                        const tracks = stream.getTracks();
+                        tracks.forEach(track => track.stop());
+                        videoElement.srcObject = null;
+                        isWebcamActive = false;
+                        connectCameraButton.style.display = 'inline-block';
+                    }
+                    const fileURL = URL.createObjectURL(file);
+                    videoElement.src = fileURL;
+                    videoElement.style.display = "block";
+                }
+            }
+            // bat dau xu ly
+            function startProcessing() {
+                processingInterval = setInterval(() => {
+                    captureFrameAndSendToServer();
+                }, 200);
+                processResultQueue();
+                requestAnimationFrame(updateFPS);
+            }
+            // ham cat va gui cac frame cho server
+            function captureFrameAndSendToServer() {
+                const canvas = document.createElement('canvas');
+                canvas.width = videoElement.videoWidth;
+                canvas.height = videoElement.videoHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+
+                const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const frameID = performance.now();
+
+                frameQueue.push(imageData);
+                worker.postMessage({ imageData, apiUrl, apiToken, id: frameID });
+            }
+            //  ham ve cac hop gioi han
+            function drawBoundingBoxes(imageData, data) {
+                const ctx = processedFrameCanvas.getContext('2d');
+                processedFrameCanvas.width = videoElement.videoWidth;
+                processedFrameCanvas.height = videoElement.videoHeight;
+
+                ctx.putImageData(imageData, 0, 0);
+
+                data.forEach(obj => {
+                    const { label, bounding_box, chars } = obj;
+                    const { x1, y1, x2, y2 } = bounding_box;
+
+                    ctx.fillStyle = '#ead529';
+                    ctx.font = '40px Arial Bolder';
+                    const textX = (x1 + x2) / 2 - ctx.measureText(chars.join('')).width / 2;
+                    const textY = y1 - 10;
+                    ctx.fillText(chars.join(' '), textX, textY);
+
+                    ctx.strokeStyle = '#00FF00';
+                    ctx.lineWidth = 4;
+                    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                });
+
+                processedFrameCanvas.style.display = 'block';
+
+                // Update FPS calculation
+                const now = performance.now();
+                frameTimestamps.push(now);
+
+                // Remove timestamps older than the averaging window
+                while (frameTimestamps[0] <= now - FPS_AVERAGE_WINDOW) {
+                    frameTimestamps.shift();
+                }
+            }
+            // ham xu ly ket qua hang doi tu server tra ve
+            function processResultQueue() {
+                setInterval(() => {
+                    if (resultQueue.length > 0 && frameQueue.length > 0) {
+                        const result = resultQueue.shift();
+                        drawBoundingBoxes(result.imageData, result.data);
+                    }
+                }, 200);
+            }
+
+            function toggleButtonsForVideo() {
+                startProcessingButtonVideo.style.display = 'inline-block';
+                startProcessingButtonWebcam.style.display = 'none';
+            }
+
+            // function toggleButtonsForWebcam() {
+            //     startProcessingButtonWebcam.style.display = 'inline-block';
+            //     startProcessingButtonVideo.style.display = 'none';
+            // }
+
+            // WEB worker
+            function getWorkerBlobUrl() {
+                const workerScript = `
+                    self.onmessage = function(event) {
+                        const { imageData, apiUrl, apiToken, id } = event.data;
+
+                        const canvas = new OffscreenCanvas(imageData.width, imageData.height);
+                        const ctx = canvas.getContext('2d');
+                        ctx.putImageData(imageData, 0, 0);
+
+                        canvas.convertToBlob({ type: 'image/jpeg' }).then(blob => {
+                            const formData = new FormData();
+                            formData.append('frame', blob, 'frame.jpg');
+
+                            fetch(apiUrl + '/process_frame', {
+                                method: 'POST',
+                                headers: {
+                                    'Authorization': apiToken
+                                },
+                                body: formData
+                            })
+                            .then(response => response.json())
+                            .then(data => {
+                                self.postMessage({ imageData, data, id });
+                            })
+                            .catch(error => {
+                                console.error('Lỗi khi gửi yêu cầu:', error.message);
+                            });
+                        });
+                    };
+                `;
+
+                const blob = new Blob([workerScript], { type: 'application/javascript' });
+                return URL.createObjectURL(blob);
+            }
+            // ham cao nhat fps
+            function updateFPS(timestamp) {
+                const now = performance.now();
+
+                if (now - lastFpsUpdate > FPS_UPDATE_INTERVAL) {
+                    const fps = frameTimestamps.length / (FPS_AVERAGE_WINDOW / 1000);
+                    fpsCounter.textContent = `FPS: ${fps.toFixed(2)}`;
+                    lastFpsUpdate = now;
+                }
+
+                requestAnimationFrame(updateFPS);
+            }
+        });
+    </script>
+</body>
+</html>
